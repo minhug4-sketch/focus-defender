@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>집중지킴이</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
+<style>
+  :root{
+    --bg1:#0b1f1c; --bg2:#10302a; --accent:#3ddc97; --accent-warn:#ff5c5c;
+    --glass:rgba(255,255,255,0.06); --border:rgba(255,255,255,0.12); --text:#eaf6f1;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{
+    min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center;
+    font-family:'Segoe UI', sans-serif; color:var(--text);
+    background:linear-gradient(135deg, var(--bg1), var(--bg2));
+    transition:background 0.6s ease; position:relative; overflow:hidden;
+  }
+  body.warn{ background:linear-gradient(135deg, #2a0d0d, #4a1414); }
+
+  .cam-box{
+    position:absolute; top:24px; right:24px; width:340px; border-radius:18px;
+    border:1px solid var(--border); background:var(--glass);
+    backdrop-filter:blur(10px); box-shadow:0 8px 24px rgba(0,0,0,0.35);
+    padding:12px;
+  }
+  .cam-box canvas{ width:100%; display:block; border-radius:12px; background:#000; aspect-ratio:4/3; }
+  .cam-label{ font-size:11px; text-align:center; padding:8px 0 12px; opacity:0.7; }
+
+  .bars{ display:flex; flex-direction:column; gap:10px; }
+  .bar-row{ font-size:13px; }
+  .bar-head{ display:flex; justify-content:space-between; margin-bottom:4px; opacity:0.9; }
+  .bar-head .pct{ font-weight:700; font-variant-numeric:tabular-nums; }
+  .bar-track{ height:9px; border-radius:999px; background:rgba(255,255,255,0.12); overflow:hidden; }
+  .bar-fill{ height:100%; border-radius:999px; width:0%; transition:width 0.25s ease; }
+  .bar-fill.focus{ background:var(--accent); }
+  .bar-fill.sleep{ background:var(--accent-warn); }
+
+  .panel{
+    background:var(--glass); border:1px solid var(--border); backdrop-filter:blur(16px);
+    border-radius:28px; padding:48px 56px; text-align:center; width:min(440px, 90vw);
+    box-shadow:0 12px 40px rgba(0,0,0,0.35);
+  }
+  .status{ font-size:22px; font-weight:600; margin-bottom:8px; letter-spacing:0.5px; }
+  .timer{ font-size:64px; font-weight:700; letter-spacing:2px; margin:16px 0; font-variant-numeric:tabular-nums; }
+  .sub{ font-size:14px; opacity:0.65; margin-bottom:24px; }
+  .confidence{ font-size:12px; opacity:0.5; margin-top:-12px; margin-bottom:20px; }
+
+  .controls{ display:flex; gap:12px; justify-content:center; margin-top:8px; }
+  button{
+    border:none; border-radius:999px; padding:12px 22px; font-size:14px; font-weight:600;
+    cursor:pointer; background:var(--accent); color:#062119; transition:transform 0.15s, opacity 0.15s;
+  }
+  button:hover{ transform:translateY(-2px); opacity:0.9; }
+  button.secondary{ background:transparent; border:1px solid var(--border); color:var(--text); }
+  button:disabled{ opacity:0.4; cursor:not-allowed; transform:none; }
+
+  body.warn .status{ color:var(--accent-warn); }
+  body.warn .panel{ border-color:rgba(255,92,92,0.4); animation:pulse 1.2s infinite; }
+  @keyframes pulse{ 0%,100%{box-shadow:0 12px 40px rgba(255,92,92,0.15);} 50%{box-shadow:0 12px 40px rgba(255,92,92,0.45);} }
+
+  .loading{ font-size:13px; opacity:0.6; margin-top:18px; }
+</style>
+</head>
+<body>
+
+  <div class="cam-box">
+    <canvas id="pose-canvas"></canvas>
+    <div class="cam-label" id="camLabel">카메라 준비 중...</div>
+    <div class="bars">
+      <div class="bar-row">
+        <div class="bar-head"><span>🟢 집중상태</span><span class="pct" id="pctFocus">0%</span></div>
+        <div class="bar-track"><div class="bar-fill focus" id="fillFocus"></div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-head"><span>🔴 졸음상태</span><span class="pct" id="pctSleep">0%</span></div>
+        <div class="bar-track"><div class="bar-fill sleep" id="fillSleep"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="status" id="status">대기 중</div>
+    <div class="timer" id="timer">00:00</div>
+    <div class="confidence" id="confidence">&nbsp;</div>
+    <div class="sub" id="sub">시작 버튼을 눌러 집중 모드를 켜주세요</div>
+    <div class="controls">
+      <button id="startBtn">시작하기</button>
+      <button id="stopBtn" class="secondary" disabled>종료</button>
+    </div>
+    <div class="loading" id="loading"></div>
+  </div>
+
+  <audio id="bgm" loop>
+    <source src="https://cdn.pixabay.com/download/audio/2022/03/15/audio_c8e6985551.mp3" type="audio/mpeg">
+  </audio>
+
+<script>
+// ====== 설정 ======
+const MODEL_URL = "./model/";           // model.json, metadata.json 위치
+const LABELS = ["집중상태", "졸음상태"];  // labels.txt 순서와 동일 (0,1)
+const DISTRACTED_THRESHOLD_SEC = 200;       // 졸음/딴짓 판단이 이 시간 이상 유지되면 경고
+const CONFIDENCE_MIN = 0.6;
+
+let model, webcam, ctx, canvas;
+let running = false;
+let focusSeconds = 0;
+let distractedStreak = 0;
+let isWarning = false;
+let loopId;
+
+const statusEl = document.getElementById('status');
+const timerEl = document.getElementById('timer');
+const subEl = document.getElementById('sub');
+const confEl = document.getElementById('confidence');
+const loadingEl = document.getElementById('loading');
+const camLabelEl = document.getElementById('camLabel');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const bgm = document.getElementById('bgm');
+const pctFocusEl = document.getElementById('pctFocus');
+const pctSleepEl = document.getElementById('pctSleep');
+const fillFocusEl = document.getElementById('fillFocus');
+const fillSleepEl = document.getElementById('fillSleep');
+
+function formatTime(sec){
+  const m = String(Math.floor(sec/60)).padStart(2,'0');
+  const s = String(sec%60).padStart(2,'0');
+  return `${m}:${s}`;
+}
+
+async function init(){
+  startBtn.disabled = true;
+
+  try{
+    // 💡 tmImage 용 웹캠 객체 생성으로 변경
+    webcam = new tmImage.Webcam(320, 240, true);
+    await webcam.setup();
+    await webcam.play();
+    canvas = document.getElementById('pose-canvas');
+    canvas.width = 320; canvas.height = 240;
+    ctx = canvas.getContext('2d');
+    camLabelEl.textContent = "카메라 연결됨";
+    previewLoop(); 
+  }catch(e){
+    camLabelEl.textContent = "카메라 권한을 확인해주세요";
+    loadingEl.textContent = "카메라를 켤 수 없습니다. 브라우저 권한 또는 https/localhost 환경인지 확인하세요.";
+    return;
+  }
+
+  loadingEl.textContent = "모델 불러오는 중...";
+  try{
+    // 💡 tmImage 라이브러리를 사용하여 모델 로드하도록 변경
+    model = await tmImage.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
+    loadingEl.textContent = "";
+    startBtn.disabled = false;
+  }catch(e){
+    loadingEl.textContent = "모델을 불러오지 못했습니다. model.json / metadata.json 경로를 확인하세요.";
+  }
+}
+
+function previewLoop(){
+  if(running) return; 
+  webcam.update();
+  ctx.drawImage(webcam.canvas, 0, 0, canvas.width, canvas.height);
+  requestAnimationFrame(previewLoop);
+}
+
+function startSession(){
+  running = true;
+  focusSeconds = 0;
+  distractedStreak = 0;
+  isWarning = false;
+  document.body.classList.remove('warn');
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  statusEl.textContent = "집중 측정 중";
+  subEl.textContent = "화면에 보이는 자세로 공부를 시작하세요";
+  bgm.volume = 0.4;
+  bgm.play().catch(()=>{});
+  timerTick();
+  loop();
+}
+
+function stopSession(){
+  running = false;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  statusEl.textContent = "대기 중";
+  subEl.textContent = "시작 버튼을 눌러 집중 모드를 켜주세요";
+  confEl.textContent = "\u00a0";
+  document.body.classList.remove('warn');
+  bgm.pause();
+  if(window.speechSynthesis) speechSynthesis.cancel();
+  previewLoop(); 
+}
+
+let timerInterval;
+function timerTick(){
+  clearInterval(timerInterval);
+  timerInterval = setInterval(()=>{
+    if(!running) return;
+    if(!isWarning) focusSeconds++;
+    timerEl.textContent = formatTime(focusSeconds);
+  }, 1000);
+}
+
+async function loop(){
+  if(!running) return;
+  try{
+    webcam.update();
+    await predict();
+  }catch(e){
+    console.error(e);
+    loadingEl.textContent = "예측 중 오류: " + e.message;
+  }
+  loopId = window.requestAnimationFrame(loop);
+}
+
+async function predict(){
+  // 💡 포즈 추정 단계를 건너뛰고 이미지 모델에 웹캠 화면을 바로 주입
+  const prediction = await model.predict(webcam.canvas);
+
+  // 화면 리프레시 및 정보 업데이트
+  ctx.drawImage(webcam.canvas, 0, 0, canvas.width, canvas.height);
+  updateBars(prediction);
+
+  let best = prediction[0];
+  for(const p of prediction){ if(p.probability > best.probability) best = p; }
+
+  confEl.textContent = `${best.className} ${(best.probability*100).toFixed(0)}%`;
+
+  const isFocused = best.className === LABELS[0];
+  const confident = best.probability >= CONFIDENCE_MIN;
+
+  if(isFocused && confident){
+    distractedStreak = 0;
+    if(isWarning){ exitWarning(); }
+  } else if(confident){
+    distractedStreak++;
+    if(distractedStreak >= DISTRACTED_THRESHOLD_SEC && !isWarning){
+      enterWarning();
+    }
+  }
+}
+
+function updateBars(prediction){
+  const focusP = prediction.find(p => p.className === LABELS[0]);
+  const sleepP = prediction.find(p => p.className === LABELS[1]);
+  const fPct = focusP ? Math.round(focusP.probability*100) : 0;
+  const sPct = sleepP ? Math.round(sleepP.probability*100) : 0;
+  pctFocusEl.textContent = fPct + "%";
+  pctSleepEl.textContent = sPct + "%";
+  fillFocusEl.style.width = fPct + "%";
+  fillSleepEl.style.width = sPct + "%";
+}
+
+function enterWarning(){
+  isWarning = true;
+  document.body.classList.add('warn');
+  statusEl.textContent = "집중력이 떨어졌어요!";
+  subEl.textContent = "자세를 바로 하고 다시 집중해보세요";
+  bgm.pause();
+  speak("집중력이 떨어졌습니다. 다시 집중해주세요.");
+}
+
+function exitWarning(){
+  isWarning = false;
+  document.body.classList.remove('warn');
+  statusEl.textContent = "집중 측정 중";
+  subEl.textContent = "화면에 보이는 자세로 공부를 시작하세요";
+  bgm.play().catch(()=>{});
+}
+
+function speak(text){
+  if(!window.speechSynthesis) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'ko-KR';
+  speechSynthesis.speak(u);
+}
+
+startBtn.addEventListener('click', startSession);
+stopBtn.addEventListener('click', stopSession);
+
+init();
+</script>
+</body>
+</html>
